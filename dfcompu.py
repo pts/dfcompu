@@ -1,7 +1,9 @@
 #! /usr/bin/python
 # by pts@fazekas.hu at Mon May 22 15:33:44 CEST 2017
 #
-# !! python2.4
+# Compatible with Python 2.4, 2.5, 2.6 and 2.7.
+#
+# TODO(pts): Add scheduling based on I/O and external waiting.
 # TODO(pts): Exception handling, error propagation.
 # TODO(pts): Produce individual results incrementally?
 # TODO(pts): Document mutability.
@@ -11,7 +13,6 @@
 # TODO(pts): Add printing the graph and peeking.
 # TODO(pts): How to delete values early during graph execution?
 #
-
 
 def is_generator_function(object):  # From inspect.isgeneratorfunction.
   CO_GENERATOR = 0x20  # From Include/code.h.  TODO(pts): Jython?
@@ -237,7 +238,7 @@ def run_graph(inputs):
     inputs = (inputs,)
   else:
     inputs = tuple(inputs)
-  unavailable_inputs = [] 
+  pending_inputs = [] 
   for input in inputs:
     if not isinstance(input, Input):
       raise TypeError(input)
@@ -247,37 +248,30 @@ def run_graph(inputs):
       if not isinstance(input, NodeBase):
       #if not getattr(input, 'node_iterator', None):
         raise TypeError('Node class expected, got: %r' % type(input))
-      unavailable_inputs.append(input)
+      pending_inputs.append(input)
       
-  if unavailable_inputs:
-    waits = [unavailable_inputs]
-    while waits:
-      inputs1 = waits[-1]
-      while inputs1:
-        if inputs1[-1].is_available():
-          inputs1.pop()
-          break
-        for wait_inputs in inputs1[-1].node_iterator:
-          if wait_inputs:
-            wait_inputs = [wait_input for wait_input in wait_inputs if
-                           not wait_input.is_available()]
-            if wait_inputs:
-              for wait_input in wait_inputs:
-                if not isinstance(wait_input, NodeBase):
-                  raise TypeError('Node class expected, got: %r' %
-                                  type(wait_input))
-              del wait_input  # Save memory.
-              waits.append(wait_inputs)
-              break  # APPEND_BREAK.
-        else:
-          wait_inputs = None
-          assert inputs1[-1].is_available()
-          inputs1.pop()
+  while pending_inputs:
+    input = pending_inputs[-1]
+    if input.is_available():
+      pending_inputs.pop()
+      break
+    for wait_inputs in input.node_iterator:
+      if wait_inputs:
+        wait_inputs = [wait_input for wait_input in wait_inputs if
+                       not wait_input.is_available()]
         if wait_inputs:
-          break  # Break one more for APPEND_BREAK.
-      if inputs1:  # Continue from APPEND_BREAK.
-        continue
-      waits.pop()
+          for wait_input in wait_inputs:
+            if not isinstance(wait_input, NodeBase):
+              raise TypeError('Node class expected, got: %r' %
+                              type(wait_input))
+          del wait_input  # Save memory.
+          pending_inputs.extend(wait_inputs)
+          del wait_inputs  # Save memory.
+          break  # APPEND_BREAK.
+    else:
+      assert input.is_available()
+      pending_inputs.pop()
+
   return inputs
 
 
@@ -348,7 +342,7 @@ if __name__ == '__main__':
   assert or_all(False, (), [], 33, 0, 44, 0.0) == 33
 
   a = 5  # !! Reuse ConstantInput objects within the graph?
-  b = ConstantInput(7)  # !!
+  b = ConstantInput(7)
   abn = (a, b)
   abn = next_fib.node(*abn)
   abn = next_fib.node(*abn)
