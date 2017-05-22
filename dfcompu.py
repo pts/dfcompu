@@ -3,6 +3,7 @@
 #
 # Compatible with Python 2.4, 2.5, 2.6 and 2.7.
 #
+# TODO(pts): Rename recipe to recipe retroactively.
 # TODO(pts): Add scheduling based on I/O and external waiting.
 # TODO(pts): Exception handling, error propagation.
 # TODO(pts): Produce individual results incrementally?
@@ -12,7 +13,13 @@
 # TODO(pts): Add execution context.
 # TODO(pts): Add printing the graph and peeking.
 # TODO(pts): How to delete values early during graph execution?
+# TODO(pts): Get rid of memory leaks and weak references.
+# TODO(pts): Support dynamic graph building and cycles that way.
+# TODO(pts): Ensure that node names are unique.
 #
+
+import collections
+import weakref
 
 def is_generator_function(object):  # From inspect.isgeneratorfunction.
   CO_GENERATOR = 0x20  # From Include/code.h.  TODO(pts): Jython?
@@ -59,6 +66,17 @@ def convert_function_to_generator(f, arg_names):
     for i, arg in enumerate(args):
       if i >= len(arg_names) or arg_names[i].endswith('_input'):
         args2.append(arg)
+      elif (isinstance(arg, ConstantInput) and
+            isinstance(arg.value, InputSequence)):
+        arg2 = []
+        for arg0 in arg.value.items:
+          if isinstance(arg0, Input):
+            yield arg0.wait()
+            arg2.append(arg0.get())
+          else:
+            arg2.append(arg0)
+        args2.append(arg2)
+        del arg2  # Save memory.
       else:
         yield arg.wait()  # !! Wait for multiple events at the same time.
         args2.append(arg.get())
@@ -69,7 +87,8 @@ def convert_function_to_generator(f, arg_names):
 
 
 class Recipe(object):
-  __slots__ = ('generator', 'arg_names', 'result_names', 'has_varargs')
+  __slots__ = ('generator', 'arg_names', 'result_names', 'has_varargs',
+               'result_tuple_type')
 
   def __init__(self, generator, result=('result',)):
     if not callable(generator) or not getattr(generator, 'func_code', None):
@@ -94,12 +113,21 @@ class Recipe(object):
       generator = convert_function_to_generator(generator, arg_names)
     self.generator = generator
     self.result_names = tuple(map(str, result))
+    if (len(self.result_names) != 1 or
+        self.result_names[0] != 'result'):
+      if getattr(collections, 'namedtuple', None):
+        self.result_tuple_type = collections.namedtuple(
+            self.generator.func_name + '___results', self.result_names)
+      else:  # Python 2.4 doesn't have collections.namedtuple.
+        self.result_tuple_type = lambda *args: tuple(args)
+    else:
+      self.result_tuple_type = None
 
   def __repr__(self):
     return 'Recipe(name=%r, %s)' % (
         self.generator.func_name,
         ', '.join('%s=%r' % (k, getattr(self, k)) for k in self.__slots__
-                  if k != 'generator'))
+                  if k != 'generator' and k != 'result_tuple_type'))
 
   def node(self, *args, **kwargs):
     return Node(self, self._prepare_args(*args, **kwargs))
@@ -109,22 +137,30 @@ class Recipe(object):
         (Node(self, self._prepare_args(*args, **kwargs)),))[0].result
 
   def _prepare_args(self, *args, **kwargs):
+    arg_names, has_varargs = self.arg_names, self.has_varargs
+    del self  # Won't be needed.
     if args:
       if kwargs:
         raise ValueError('Both *args and **kwargs specified.')
       args = list(args)
     else:
-      order_dict = dict((v, k) for k, v in enumerate(self.arg_names))
-      args = [None] * len(self.arg_names)
+      order_dict = dict((v, k) for k, v in enumerate(arg_names))
+      args = [None] * len(arg_names)
       for k,v in kwargs.iteritems():
         args[order_dict[k]] = v
     for i, arg in enumerate(args):
       if not isinstance(arg, Input):
         args[i] = ConstantInput(arg)
-    if ((not self.has_varargs and len(args) != len(self.arg_names)) or
-        (self.has_varargs and len(args) < len(self.arg_names))):
+    if ((not has_varargs and len(args) != len(arg_names)) or
+        (has_varargs and len(args) < len(arg_names))):
       raise ValueError('Recipe to be called with wrong number of arguments.')
     return args
+
+
+class InputSequence(object):
+  __slots__ = ('items',)
+  def __init__(self, *args):
+    self.items = tuple(args)
 
 
 class NodeBase(Input):
@@ -161,11 +197,11 @@ class NodeSubresultInput(NodeBase):
     # e.g. in run_graph.
     return '%s.%s' % (
         self.node.name, self.node.recipe.result_names[self.i])
-    
+
 
 class Node(NodeBase):
   __slots__ = ('result', 'has_result', 'recipe', 'inputs', 'node_iterator',
-               'name')
+               'name', '__weakref__')
 
   def __init__(self, recipe, inputs):
     if not isinstance(recipe, Recipe):
@@ -176,13 +212,27 @@ class Node(NodeBase):
     if ((not recipe.has_varargs and len(inputs) != len(recipe.arg_names)) or
         (recipe.has_varargs and len(inputs) < len(recipe.arg_names))):
       raise ValueError('Recipe Node with wrong number of arguments.')
+
+    def wrap_node_iterator(weak_node, iterator):
+      for value in iterator:
+        if weak_node().has_result:
+          raise RuntimeError('Multiple values yielded by recipe iterator.')
+        if isinstance(value, Wait):
+          yield value.inputs
+        elif isinstance(value, Input):
+          yield value.wait().inputs
+          weak_node().set_result(value.get())
+        else:
+          weak_node().set_result(value)
+      if not weak_node().has_result:
+        raise RuntimeError('No values yielded by recipe iterator.')
+
     self.result = None
     self.has_result = False
     self.recipe = recipe
     self.inputs = inputs  # TODO(pts): Does this cause memory leaks?
-    # !! There is a circular reference here?!
-    self.node_iterator = self.wrap_node_iterator(
-        self.recipe.generator(*inputs))
+    self.node_iterator = wrap_node_iterator(
+        weakref.ref(self), self.recipe.generator(*inputs))
     self.name = self.recipe.generator.func_name
 
   def __repr__(self):
@@ -214,21 +264,16 @@ class Node(NodeBase):
   def set_result(self, result):
     if self.has_result:
       raise RuntimeError('Setting result multiple times.')
+    if self.recipe.result_tuple_type:
+      if not isinstance(result, (tuple, list)):
+        raise ValueError('tuple result expected.')
+      if len(result) != len(self.recipe.result_names):
+        raise ValueError('Result tuple size mismatch: expected=%d, got=%d' %
+                         (len(self.recipe.result_names), len(result)))
+      result = self.recipe.result_tuple_type(*result)
     self.has_result = True
     self.result = result
     self.node_iterator = None
-
-  def wrap_node_iterator(self, iterator):
-    for value in iterator:
-      if self.has_result:
-        raise RuntimeError('Multiple values yielded by recipe iterator.')
-      if isinstance(value, Wait):
-        yield value.inputs
-      elif isinstance(value, Input):
-        yield value.wait().inputs
-        self.set_result(value.get())
-      else:
-        self.set_result(value)
 
   def __len__(self):
     return len(self.recipe.result_names)
@@ -243,7 +288,16 @@ class Node(NodeBase):
 
 
 def _find_all_nodes(inputs):
-  todo = list(inputs)
+  todo = []
+  for input3 in inputs:
+    if (isinstance(input3, ConstantInput) and
+        isinstance(input3.value, InputSequence)):
+      todo.extend(input2 for input2 in input3.value.items
+                  if isinstance(input2, Input) and
+                  not input2.is_available() and
+                  id(input2) not in cache)
+    else:
+      todo.append(input3)
   result = []
   cache = set()
   for input in todo:
@@ -256,33 +310,17 @@ def _find_all_nodes(inputs):
         result.append(input)
         todo.extend(input2 for input2 in input.inputs
                     if not input2.is_available() and id(input2) not in cache)
+        for input3 in input.inputs:
+          if (isinstance(input3, ConstantInput) and
+              isinstance(input3.value, InputSequence)):
+            todo.extend(input2 for input2 in input3.value.items
+                        if isinstance(input2, Input) and
+                        not input2.is_available() and
+                        id(input2) not in cache)
   return result
 
 
-def run_graph(inputs):
-  """Makes sure all inputs are available.
-
-  run_graph is idempotent, it doesn't rerun already computed nodes.
-
-  Returns:
-    inputs converted to tuple, all available.
-  """
-  if isinstance(inputs, Input):
-    inputs = (inputs,)
-  else:
-    inputs = tuple(inputs)
-  pending_inputs = [] 
-  for input in inputs:
-    if not isinstance(input, Input):
-      raise TypeError(input)
-    if not input.is_available():
-      # This subclass is needed by run_graph because it uses the
-      # .node_iterator property.
-      if not isinstance(input, NodeBase):
-      #if not getattr(input, 'node_iterator', None):
-        raise TypeError('Node class expected, got: %r' % type(input))
-      pending_inputs.append(input)
-  nodes = _find_all_nodes(pending_inputs)
+def _rename_nodes(nodes):
   node_name_counts = {}
   for node in nodes:
     name = node.name
@@ -297,8 +335,38 @@ def run_graph(inputs):
     if nc is not None:
       node.name += '#%d' % nc
       node_name_counts[name] = nc - 1
-  print 'All nodes: %r' % [node.name for node in nodes]
 
+
+def run_graph(inputs):
+  """Makes sure all inputs are available.
+
+  run_graph is idempotent, it doesn't rerun already computed nodes.
+
+  Returns:
+    inputs converted to tuple, all available.
+  """
+  if isinstance(inputs, Input):
+    inputs = (inputs,)
+  else:
+    inputs = tuple(inputs)
+  pending_inputs = []
+  for input in inputs:
+    if not isinstance(input, Input):
+      raise TypeError(input)
+    if not input.is_available():
+      # This subclass is needed by run_graph because it uses the
+      # .node_iterator property.
+      if not isinstance(input, NodeBase):
+      #if not getattr(input, 'node_iterator', None):
+        raise TypeError('Node class expected, got: %r' % type(input))
+      pending_inputs.append(input)
+
+  nodes = _find_all_nodes(pending_inputs)
+  _rename_nodes(nodes)
+  print 'All nodes: %r' % [node.name for node in nodes]
+  del nodes  # Save memory.
+
+  # Run nodes whose result is necessary.
   while pending_inputs:
     input = pending_inputs[-1]
     if input.is_available():
@@ -327,7 +395,7 @@ def run_graph(inputs):
 def recipe(*args, **kwargs):
   """Annotation on functions and generators to create Recipe objects."""
   # !! doc: All *args are of type Input.
-  if kwargs:
+  if kwargs or not args:
     if args:
       raise ValueError
     return lambda f: Recipe(f, **kwargs)
@@ -353,7 +421,7 @@ def next_fib(a, b):
   return b, a + b
 
 
-@recipe
+@recipe()  # () is not needed.
 def cond(c, true_input, false_input):
   if c:
     return true_input
@@ -382,6 +450,17 @@ def or_all(*args):
       break
 
 
+@recipe
+def noop():
+  if 0:
+    yield 42
+
+
+@recipe
+def add_tuple(a, b):
+  return tuple(a) + tuple(b)
+
+
 if __name__ == '__main__':
   print area
   print area(5, 6)
@@ -405,14 +484,21 @@ if __name__ == '__main__':
   assert run_graph(next_fib.node(20, 30)[1])[0].get() == 50
   assert next_fib.node(20, 30)[1].run() == 50
   assert next_fib.node(20, 30).run() == (30, 50)
-  
+
   _, c = next_fib.node(a, b)
   area_ab = area.node(a, b)
   circumference_ab = circumference.node(a, b)
   acr = cond.node(c, area_ab, circumference_ab)
-  
+
   run_graph((acr,))
   assert acr.is_available()
   assert acr.get() == 35
+
+  try:
+    assert 0, noop.node().run()
+  except RuntimeError, e:
+    assert str(e) == 'No values yielded by recipe iterator.'
+
+  assert add_tuple(InputSequence(5, area.node(2, 3)), [7]) == (5, 6, 7)
 
   print 'All OK.'
