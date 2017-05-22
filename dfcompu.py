@@ -132,10 +132,13 @@ class NodeBase(Input):
 
 
 class NodeSubresultInput(NodeBase):
+  # .name has same interface as Node, for run_graph.
   __slots__ = ('node', 'i')
   def __init__(self, node, i):
     self.node = node
     self.i = i
+    #self.name = '%s.%s' % (
+    #    self.node.name, self.node.recipe.result_names[self.i])
   def __repr__(self):
     return 'NodeSubResultInput(node=%r, i=%d)' % (self.node, self.i)
   def get(self):
@@ -149,10 +152,20 @@ class NodeSubresultInput(NodeBase):
   @property  # Same interface as Node, for run_graph.
   def node_iterator(self):
     return self.node.node_iterator
-
+  @property  # Same interface as Node, for run_graph.
+  def inputs(self):
+    return self.node.node_iterator
+  @property  # Same interface as Node, for run_graph.
+  def name(self):
+    # Recomputing the name every time, in case self.node.name has changed,
+    # e.g. in run_graph.
+    return '%s.%s' % (
+        self.node.name, self.node.recipe.result_names[self.i])
+    
 
 class Node(NodeBase):
-  __slots__ = ('result', 'has_result', 'recipe', 'inputs', 'node_iterator')
+  __slots__ = ('result', 'has_result', 'recipe', 'inputs', 'node_iterator',
+               'name')
 
   def __init__(self, recipe, inputs):
     if not isinstance(recipe, Recipe):
@@ -166,10 +179,11 @@ class Node(NodeBase):
     self.result = None
     self.has_result = False
     self.recipe = recipe
-    self.inputs = inputs
+    self.inputs = inputs  # TODO(pts): Does this cause memory leaks?
     # !! There is a circular reference here?!
     self.node_iterator = self.wrap_node_iterator(
         self.recipe.generator(*inputs))
+    self.name = self.recipe.generator.func_name
 
   def __repr__(self):
     # TODO(pts): Display inputs, detect cycles.
@@ -228,8 +242,27 @@ class Node(NodeBase):
     return NodeSubresultInput(self, i)
 
 
+def _find_all_nodes(inputs):
+  todo = list(inputs)
+  result = []
+  cache = set()
+  for input in todo:
+    if not input.is_available() and isinstance(input, NodeBase):
+      if isinstance(input, NodeSubresultInput):
+        input = input.node
+      input_id = id(input)
+      if input_id not in cache:
+        cache.add(input_id)
+        result.append(input)
+        todo.extend(input2 for input2 in input.inputs
+                    if not input2.is_available() and id(input2) not in cache)
+  return result
+
+
 def run_graph(inputs):
   """Makes sure all inputs are available.
+
+  run_graph is idempotent, it doesn't rerun already computed nodes.
 
   Returns:
     inputs converted to tuple, all available.
@@ -249,7 +282,23 @@ def run_graph(inputs):
       #if not getattr(input, 'node_iterator', None):
         raise TypeError('Node class expected, got: %r' % type(input))
       pending_inputs.append(input)
-      
+  nodes = _find_all_nodes(pending_inputs)
+  node_name_counts = {}
+  for node in nodes:
+    name = node.name
+    node_name_counts[name] = node_name_counts.get(name, 0) + 1
+  for node in nodes:
+    name = node.name
+    if node_name_counts[name] == 1:
+      del node_name_counts[name]
+  for node in reversed(nodes):
+    name = node.name
+    nc = node_name_counts.get(name)
+    if nc is not None:
+      node.name += '#%d' % nc
+      node_name_counts[name] = nc - 1
+  print 'All nodes: %r' % [node.name for node in nodes]
+
   while pending_inputs:
     input = pending_inputs[-1]
     if input.is_available():
