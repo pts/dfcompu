@@ -3,6 +3,7 @@
 #
 # Compatible with Python 2.4, 2.5, 2.6 and 2.7.
 #
+# TODO(pts): Add force_name to Recipe and Node for presistence.
 # TODO(pts): Rename recipe to recipe retroactively.
 # TODO(pts): Add scheduling based on I/O and external waiting.
 # TODO(pts): Exception handling, error propagation.
@@ -60,6 +61,38 @@ class ConstantInput(Input):
     return EMPTY_WAIT
 
 
+class ContextInput(Input):
+  __slots__ = ('key', 'context')
+  def __init__(self, key):
+    if not isinstance(key, str) and key is not None:
+      raise TypeError
+    self.key = key
+    self.context = None
+  def __repr__(self):
+    return 'ContextInput(key=%r)' % (self.key,)
+  def get(self):
+    context = self.context
+    if context is None:
+      raise ValueError('Context not set in get.')
+    if self.key is None:
+      return context
+    return self.context[self.key]  # Can raise KeyError.
+  def is_available(self):
+    return self.context is not None
+  def wait(self):
+    if self.context is None:
+      raise ValueError('Cannot wait for context.')
+    return EMPTY_WAIT
+  def set_context(self, context):
+    if self.context is context:
+      return
+    if self.context is not None:
+      raise RuntimeError('Context already set.')
+    if not isinstance(context, dict):
+      raise RuntimeError('Context must be a dict.')
+    self.context = context
+
+
 def convert_function_to_generator(f, arg_names):
   def generator(*args):
     args2 = []
@@ -71,14 +104,14 @@ def convert_function_to_generator(f, arg_names):
         arg2 = []
         for arg0 in arg.value.items:
           if isinstance(arg0, Input):
-            yield arg0.wait()
+            yield arg0.wait()  # !! Wait for multiple events at the same time, for multithreading.
             arg2.append(arg0.get())
           else:
             arg2.append(arg0)
         args2.append(arg2)
         del arg2  # Save memory.
       else:
-        yield arg.wait()  # !! Wait for multiple events at the same time.
+        yield arg.wait()  # !! Wait for multiple events at the same time, for multithreading.
         args2.append(arg.get())
     del args  # Save memory.
     yield f(*args2)
@@ -151,6 +184,14 @@ class Recipe(object):
     for i, arg in enumerate(args):
       if not isinstance(arg, Input):
         args[i] = ConstantInput(arg)
+    if len(args) < len(arg_names):
+      missing_arg_names = [arg_name for arg_name in arg_names[len(args):]
+                           if arg_name != 'context' and
+                           not arg_name.endswith('_context')]
+      if missing_arg_names:
+        raise ValueError('Missing args for recipe: %r' % missing_arg_names)
+      while len(args) < len(arg_names):
+        args.append(ConstantInput(None))  # For context arg.
     if ((not has_varargs and len(args) != len(arg_names)) or
         (has_varargs and len(args) < len(arg_names))):
       raise ValueError('Recipe to be called with wrong number of arguments.')
@@ -183,7 +224,7 @@ class NodeSubresultInput(NodeBase):
     return self.node.is_available()
   def wait(self):
     return self.node.wait()
-  def run(self):  # Convenience method, same interface as Node.
+  def run(self, **kwargs):  # Convenience method, same interface as Node.
     return run_graph((self,))[0].get()
   @property  # Same interface as Node, for run_graph.
   def node_iterator(self):
@@ -213,7 +254,9 @@ class Node(NodeBase):
         (recipe.has_varargs and len(inputs) < len(recipe.arg_names))):
       raise ValueError('Recipe Node with wrong number of arguments.')
 
-    def wrap_node_iterator(weak_node, iterator):
+    def wrap_node_iterator(weak_node, generator, inputs):
+      iterator = generator(*inputs)  # This is delayed until the first call.
+      del generator, inputs  # Save memory.  !!
       for value in iterator:
         if weak_node().has_result:
           raise RuntimeError('Multiple values yielded by recipe iterator.')
@@ -230,10 +273,11 @@ class Node(NodeBase):
     self.result = None
     self.has_result = False
     self.recipe = recipe
-    self.inputs = inputs  # TODO(pts): Does this cause memory leaks?
-    self.node_iterator = wrap_node_iterator(
-        weakref.ref(self), self.recipe.generator(*inputs))
+    # list instead of tuple so _fix_context_inputs can change it in place.
+    self.inputs = list(inputs)  # TODO(pts): Does this cause memory leaks?
     self.name = self.recipe.generator.func_name
+    self.node_iterator = wrap_node_iterator(
+        weakref.ref(self), self.recipe.generator, self.inputs)
 
   def __repr__(self):
     # TODO(pts): Display inputs, detect cycles.
@@ -243,9 +287,9 @@ class Node(NodeBase):
         (self.recipe, self.has_result, self.result, len(self.inputs),
          len(self.recipe.result_names)))
 
-  def run(self):
+  def run(self, **kwargs):
     """Convenience method to call run_graph."""
-    return run_graph((self,))[0].get()
+    return run_graph((self,), **kwargs)[0].get()
 
   def get(self):
     if not self.has_result:
@@ -337,7 +381,42 @@ def _rename_nodes(nodes):
       node_name_counts[name] = nc - 1
 
 
-def run_graph(inputs):
+def yield_inputs(input):
+  if (isinstance(input, ConstantInput) and
+      isinstance(input.value, InputSequence)):
+    for input2 in input.value.items:
+      if isinstance(input2, Input):
+        yield input
+  else:
+    yield input
+
+
+def _fix_context_inputs(nodes):
+  for node in nodes:
+    arg_names = node.recipe.arg_names
+    inputs = node.inputs
+    len_arg_names = len(arg_names)
+    for i, input in enumerate(inputs):
+      if i >= len(arg_names):
+        break
+      arg_name = arg_names[i]
+      if (arg_name == 'context' and isinstance(input, ConstantInput) and
+          input.value is None):
+        inputs[i] = ContextInput(None)
+      elif (arg_name.endswith('_context') and
+            isinstance(input, ConstantInput) and input.value is None):
+        inputs[i] = ContextInput(arg_name[:arg_name.rfind('_')])
+
+
+def _add_context_to_node_inputs(nodes, context):
+  for node in nodes:
+    for input in node.inputs:
+      for input2 in yield_inputs(input):
+        if isinstance(input2, ContextInput):
+          input2.set_context(context)
+
+
+def run_graph(inputs, context=None):
   """Makes sure all inputs are available.
 
   run_graph is idempotent, it doesn't rerun already computed nodes.
@@ -345,6 +424,10 @@ def run_graph(inputs):
   Returns:
     inputs converted to tuple, all available.
   """
+  if context is None:
+    context = {}
+  elif not isinstance(context, dict):
+    raise TypeError('context must be a dict.')
   if isinstance(inputs, Input):
     inputs = (inputs,)
   else:
@@ -364,6 +447,8 @@ def run_graph(inputs):
   nodes = _find_all_nodes(pending_inputs)
   _rename_nodes(nodes)
   print 'All nodes: %r' % [node.name for node in nodes]
+  _fix_context_inputs(nodes)
+  _add_context_to_node_inputs(nodes, context)
   del nodes  # Save memory.
 
   # Run nodes whose result is necessary.
@@ -461,6 +546,16 @@ def add_tuple(a, b):
   return tuple(a) + tuple(b)
 
 
+@recipe
+def cmul(a, b_context):
+  return a * b_context
+
+
+@recipe
+def xkeys(context):
+  return sorted(context)
+
+
 if __name__ == '__main__':
   print area
   print area(5, 6)
@@ -500,5 +595,11 @@ if __name__ == '__main__':
     assert str(e) == 'No values yielded by recipe iterator.'
 
   assert add_tuple(InputSequence(5, area.node(2, 3)), [7]) == (5, 6, 7)
+
+  assert xkeys.node(None).run(context={'Jan': 0, 'Feb': 1}) == ['Feb', 'Jan']
+  assert cmul.node(5, ContextInput('x')).run(context={'x': 8}) == 40
+  assert cmul.node(5, None).run(context={'b': 8}) == 40 
+  # It's OK to omit the _trailing_ context args.
+  assert cmul.node(5).run(context={'b': 8}) == 40 
 
   print 'All OK.'
