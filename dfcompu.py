@@ -4,15 +4,12 @@
 # !! python2.4
 # TODO(pts): Produce individual results incrementally?
 # TODO(pts): Document mutability.
-# TODO(pts): Add multithreaded (thread pool) run_graph.
+# TODO(pts): Add multithreaded (thread pool, thread-safe) run_graph.
 # TODO(pts): Add graph context.
 # TODO(pts): Add execution context.
 # TODO(pts): Add printing the graph and peeking.
+# TODO(pts): How to delete values early during graph execution?
 #
-
-
-def g():
-  yield 5
 
 
 def is_generator_function(object):  # From inspect.isgeneratorfunction.
@@ -21,14 +18,20 @@ def is_generator_function(object):  # From inspect.isgeneratorfunction.
 
 
 class Wait(object):
-  pass
+  __slots__ = ('inputs',)
+  def __init__(self, inputs):
+    self.inputs = inputs
 
 
-EMPTY_WAIT = Wait()  
+EMPTY_WAIT = Wait(())
 
 
 class Input(object):
   def get(self):
+    raise NotImplementedError('Subclasses should implement this.')
+  def is_available(self):
+    raise NotImplementedError('Subclasses should implement this.')
+  def wait(self):
     raise NotImplementedError('Subclasses should implement this.')
 
 
@@ -40,6 +43,8 @@ class ConstantInput(Input):
     return 'ConstantInput(%r)' % (self.value,)
   def get(self):
     return self.value
+  def is_available(self):
+    return True
   def wait(self):
     return EMPTY_WAIT
 
@@ -141,13 +146,15 @@ class NodeSubresultInput(Input):
   def __repr__(self):
     return 'NodeSubResultInput(node=%r, i=%d)' % (self.node, self.i)
   def get(self):
-    return self.node.get()[i]
+    return self.node.get()[self.i]
+  def is_available(self):
+    return self.node.is_available()
   def wait(self):
     return self.node.wait()
 
 
 class Node(Input):
-  __slots__ = ('value', 'has_value', 'recipe', 'inputs')
+  __slots__ = ('value', 'has_value', 'recipe', 'inputs', 'generator')
 
   def __init__(self, recipe, inputs):
     if not isinstance(recipe, Recipe):
@@ -158,26 +165,42 @@ class Node(Input):
     if ((not recipe.has_varargs and len(inputs) != len(recipe.arg_names)) or
         (recipe.has_varargs and len(inputs) < len(recipe.arg_names))):
       raise ValueError('Recipe Node with wrong number of arguments.')
-    self.value = None
-    self.has_value = False
+    self.result = None
+    self.has_result = False
     self.recipe = recipe
     self.inputs = inputs
+    self.iterator = self.recipe.generator(*inputs)
 
   def __repr__(self):
     # TODO(pts): Display inputs, detect cycles.
     return (
-        'Node(recipe=%r, has_value=%r, value=%r, '
+        'Node(recipe=%r, has_result=%r, result=%r, '
         'inputs=#%d, results=#%d)' %
-        (self.recipe, self.has_value, self.value, len(self.inputs),
+        (self.recipe, self.has_result, self.result, len(self.inputs),
          len(self.recipe.result_names)))
 
   def get(self):
-    if not self.has_value:
-      raise RuntimeError('Node value not available yet.')
-    return self.value
+    if not self.has_result:
+      raise RuntimeError('Node result not available yet.')
+    return self.result
+
+  def is_available(self):
+     return self.has_result
 
   def wait(self):
-    raise RuntimeError('Node value not available for waiting.')
+    if self.has_result:
+      return EMPTY_WAIT
+    else:
+      return Wait((self,))
+
+  def set_result(self, result):
+    if self.has_result:
+      raise RuntimeError('Setting result multiple times.')
+    self.has_result = True
+    self.result = result
+    for value in self.iterator:
+      raise RuntimeError('Multiple values yielded by recipe iterator.')
+    self.iterator = None
 
   def __len__(self):
     return len(self.recipe.result_names)
@@ -190,10 +213,61 @@ class Node(Input):
     return NodeSubresultInput(self, i)
 
 
-# Annotation on functions and generators.
+def run_graph(inputs):
+  """Makes sure all inputs are available.
+
+  Returns:
+    inputs converted to tuple, all available.
+  """
+  inputs = tuple(inputs)
+  unavailable_inputs = [] 
+  for input in inputs:
+    if not isinstance(input, Input):
+      raise TypeError(input)
+    if not input.is_available():
+      unavailable_inputs.append(input)
+  if unavailable_inputs:
+    waits = [unavailable_inputs]
+    while waits:
+      inputs1 = waits[-1]
+      while inputs1:
+        if inputs1[-1].is_available():
+          inputs1.pop()
+          break
+        # TODO(pts): Nicer catch of StopIteration.
+        iterator = inputs1[-1].iterator  # !! do we always have .iterator property and .set_result(...) method.
+        yielded_value = iterator.next()  # !! always next method?
+        if isinstance(yielded_value, Wait):
+          wait_inputs = yielded_value.inputs
+          del yielded_value  # Save memory.
+          if wait_inputs:
+            waits.append(list(wait_inputs))  # !! Remove availables first.
+            break  # APPEND_BREAK.
+        else:
+          if isinstance(yielded_value, Input):
+            #def set_result_generator(node, 
+            #  node.set_result(
+            #  
+            #  inputs1
+            #new_
+            #inputs1[-1].set  yielded_value.get()
+            assert 000, '!!'
+          inputs1[-1].set_result(yielded_value)
+          assert inputs1[-1].is_available()
+          inputs1.pop()
+      if inputs1:  # Continue from APPEND_BREAK.
+        continue
+      waits.pop()
+  return inputs
+
+
 def recipe(*args, **kwargs):
+  """Annotation on functions and generators to create Recipe objects."""
+  # !! doc: All *args are of type Input.
   if kwargs:
-    return lambda f: Recipe(f, **kwargs)  # !! add result
+    if args:
+      raise ValueError
+    return lambda f: Recipe(f, **kwargs)
   else:
     if len(args) != 1:
       raise ValueError
@@ -255,15 +329,21 @@ if __name__ == '__main__':
 
   a = 5  # !! Reuse ConstantInput objects within the graph?
   b = ConstantInput(7)  # !!
-  bc = next_fib.node(a, b)
-  print bc
-  bc0, bc1 = bc
+  abn = (a, b)
+  abn = next_fib.node(*abn)
+  abn = next_fib.node(*abn)
+  abn = next_fib.node(*abn)
+  rgv = run_graph((abn, b))
+  print rgv
+  assert len(rgv) == 2
+  assert rgv[0].get() == (19, 31)
+  assert rgv[1] is b
   
   _, c = next_fib.node(a, b)
   area_ab = area.node(a, b)
   circumference_ab = circumference.node(a, b)
   acr = cond.node(c, area_ab, circumference_ab)
   
-  run_graph([acr])
+  run_graph((acr,))
   assert acr.is_available()
   assert acr.get() == 35
