@@ -2,6 +2,7 @@
 # by pts@fazekas.hu at Mon May 22 15:33:44 CEST 2017
 #
 # !! python2.4
+# TODO(pts): Exception handling, error propagation.
 # TODO(pts): Produce individual results incrementally?
 # TODO(pts): Document mutability.
 # TODO(pts): Add multithreaded (thread pool, thread-safe) run_graph.
@@ -28,6 +29,7 @@ EMPTY_WAIT = Wait(())
 
 class Input(object):
   def get(self):
+    # Must not return a subclass of Input.
     raise NotImplementedError('Subclasses should implement this.')
   def is_available(self):
     raise NotImplementedError('Subclasses should implement this.')
@@ -100,6 +102,10 @@ class Recipe(object):
   def node(self, *args, **kwargs):
     return Node(self, self._prepare_args(*args, **kwargs))
 
+  def __call__(self, *args, **kwargs):
+    return run_graph(
+        (Node(self, self._prepare_args(*args, **kwargs)),))[0].result
+
   def _prepare_args(self, *args, **kwargs):
     if args:
       if kwargs:
@@ -117,25 +123,6 @@ class Recipe(object):
         (self.has_varargs and len(args) < len(self.arg_names))):
       raise ValueError('Recipe to be called with wrong number of arguments.')
     return args
-
-  def __call__(self, *args, **kwargs):
-    args = self._prepare_args(*args, **kwargs)
-    del kwargs  # Save memory.
-    # !! Use run_graph.
-    has_value = False
-    result = None
-    for value in self.generator(*args):
-      if isinstance(value, Wait):
-        continue  # !!
-      if has_value:
-        raise RuntimeError('Multiple values yielded by recipe generator.')
-      has_value = True
-      result = value
-    if isinstance(result, Input):
-      result.wait()  # !!
-      result = result.get()
-    # !! Process tuple results.
-    return result
 
 
 class NodeSubresultInput(Input):
@@ -213,13 +200,41 @@ class Node(Input):
     return NodeSubresultInput(self, i)
 
 
+class SetResultHelper(Input):
+  __slots__ = ('iterator', 'taget_node')
+  def __init__(self, target_node, input):
+    def set_result_generator(target_node, input):
+      yield input.wait()
+      target_node.set_result(input.get())
+      yield None
+    self.iterator = set_result_generator(target_node, input)
+    self.target_node = target_node
+  def __repr__(self):
+    return 'SetResultHelper(...)'
+  def get(self):
+    return self.value
+  def is_available(self):
+    return self.target_node.is_available()
+  def wait(self):
+    if self.target_node.is_available():
+      return EMPTY_WAIT
+    else:
+      return Wait((self,))
+  def set_result(self, result):
+    if result is not None:
+      raise RuntimeError('SetResultHelper.set_result must not be called.')
+    
+
 def run_graph(inputs):
   """Makes sure all inputs are available.
 
   Returns:
     inputs converted to tuple, all available.
   """
-  inputs = tuple(inputs)
+  if isinstance(inputs, Input):
+    inputs = (inputs,)
+  else:
+    inputs = tuple(inputs)
   unavailable_inputs = [] 
   for input in inputs:
     if not isinstance(input, Input):
@@ -230,6 +245,8 @@ def run_graph(inputs):
     waits = [unavailable_inputs]
     while waits:
       inputs1 = waits[-1]
+      # !! All elements of inputs1 must be Node or SetResultHelper.
+      # !! What if it's a NodeSubresultInput?
       while inputs1:
         if inputs1[-1].is_available():
           inputs1.pop()
@@ -243,15 +260,15 @@ def run_graph(inputs):
           if wait_inputs:
             waits.append(list(wait_inputs))  # !! Remove availables first.
             break  # APPEND_BREAK.
+        elif isinstance(yielded_value, Input):
+          if yielded_value.is_available():
+            inputs1[-1].set_result(yielded_value.get())
+            assert inputs1[-1].is_available()
+            inputs1.pop()
+          else:
+            waits.append([SetResultHelper(inputs1[-1], yielded_value)])
+            break  # APPEND_BREAK.
         else:
-          if isinstance(yielded_value, Input):
-            #def set_result_generator(node, 
-            #  node.set_result(
-            #  
-            #  inputs1
-            #new_
-            #inputs1[-1].set  yielded_value.get()
-            assert 000, '!!'
           inputs1[-1].set_result(yielded_value)
           assert inputs1[-1].is_available()
           inputs1.pop()
@@ -338,6 +355,9 @@ if __name__ == '__main__':
   assert len(rgv) == 2
   assert rgv[0].get() == (19, 31)
   assert rgv[1] is b
+
+  #!! assert 0, run_graph(next_fib.node(20, 30)[1])
+  #!! assert 0, next_fib.node(20, 30)[1].run()
   
   _, c = next_fib.node(a, b)
   area_ab = area.node(a, b)
@@ -347,3 +367,5 @@ if __name__ == '__main__':
   run_graph((acr,))
   assert acr.is_available()
   assert acr.get() == 35
+
+  print 'All OK.'
