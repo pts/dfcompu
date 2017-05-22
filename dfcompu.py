@@ -28,6 +28,7 @@ EMPTY_WAIT = Wait(())
 
 
 class Input(object):
+  __slots__ = ()
   def get(self):
     # Must not return a subclass of Input.
     raise NotImplementedError('Subclasses should implement this.')
@@ -138,10 +139,15 @@ class NodeSubresultInput(Input):
     return self.node.is_available()
   def wait(self):
     return self.node.wait()
+  def run(self):  # Convenience method, same interface as Node.
+    return run_graph((self,))[0].get()
+  @property  # Same interface as Node, for run_graph.
+  def node_iterator(self):
+    return self.node.node_iterator
 
 
 class Node(Input):
-  __slots__ = ('value', 'has_value', 'recipe', 'inputs', 'generator')
+  __slots__ = ('result', 'has_result', 'recipe', 'inputs', 'node_iterator')
 
   def __init__(self, recipe, inputs):
     if not isinstance(recipe, Recipe):
@@ -156,7 +162,9 @@ class Node(Input):
     self.has_result = False
     self.recipe = recipe
     self.inputs = inputs
-    self.iterator = self.recipe.generator(*inputs)
+    # !! There is a circular reference here?!
+    self.node_iterator = self.wrap_node_iterator(
+        self.recipe.generator(*inputs))
 
   def __repr__(self):
     # TODO(pts): Display inputs, detect cycles.
@@ -165,6 +173,10 @@ class Node(Input):
         'inputs=#%d, results=#%d)' %
         (self.recipe, self.has_result, self.result, len(self.inputs),
          len(self.recipe.result_names)))
+
+  def run(self):
+    """Convenience method to call run_graph."""
+    return run_graph((self,))[0].get()
 
   def get(self):
     if not self.has_result:
@@ -185,13 +197,25 @@ class Node(Input):
       raise RuntimeError('Setting result multiple times.')
     self.has_result = True
     self.result = result
-    for value in self.iterator:
-      raise RuntimeError('Multiple values yielded by recipe iterator.')
-    self.iterator = None
+    self.node_iterator = None
+
+  def wrap_node_iterator(self, iterator):
+    for value in iterator:
+      if self.has_result:
+        raise RuntimeError('Multiple values yielded by recipe iterator.')
+      if isinstance(value, Wait):
+        yield value.inputs
+      elif isinstance(value, Input):
+        yield value.wait().inputs
+        self.set_result(value.get())
+      else:
+        self.set_result(value)
+    yield None
 
   def __len__(self):
     return len(self.recipe.result_names)
 
+  # Used by x, y, ... = foo.node(...)
   def __getitem__(self, i):
     # Creating a NodeSubresultInput on the fly, to avoid circular references.
     # TODO(pts): Use a weakref.
@@ -199,31 +223,6 @@ class Node(Input):
       raise IndexError
     return NodeSubresultInput(self, i)
 
-
-class SetResultHelper(Input):
-  __slots__ = ('iterator', 'taget_node')
-  def __init__(self, target_node, input):
-    def set_result_generator(target_node, input):
-      yield input.wait()
-      target_node.set_result(input.get())
-      yield None
-    self.iterator = set_result_generator(target_node, input)
-    self.target_node = target_node
-  def __repr__(self):
-    return 'SetResultHelper(...)'
-  def get(self):
-    return self.value
-  def is_available(self):
-    return self.target_node.is_available()
-  def wait(self):
-    if self.target_node.is_available():
-      return EMPTY_WAIT
-    else:
-      return Wait((self,))
-  def set_result(self, result):
-    if result is not None:
-      raise RuntimeError('SetResultHelper.set_result must not be called.')
-    
 
 def run_graph(inputs):
   """Makes sure all inputs are available.
@@ -245,33 +244,21 @@ def run_graph(inputs):
     waits = [unavailable_inputs]
     while waits:
       inputs1 = waits[-1]
-      # !! All elements of inputs1 must be Node or SetResultHelper.
-      # !! What if it's a NodeSubresultInput?
+      # !! All elements of inputs1 must be Node or NodeSubresultInput.
+      #    Only these classes have the .node_iterator propery.
       while inputs1:
         if inputs1[-1].is_available():
           inputs1.pop()
           break
         # TODO(pts): Nicer catch of StopIteration.
-        iterator = inputs1[-1].iterator  # !! do we always have .iterator property and .set_result(...) method.
-        yielded_value = iterator.next()  # !! always next method?
-        if isinstance(yielded_value, Wait):
-          wait_inputs = yielded_value.inputs
-          del yielded_value  # Save memory.
-          if wait_inputs:
-            waits.append(list(wait_inputs))  # !! Remove availables first.
-            break  # APPEND_BREAK.
-        elif isinstance(yielded_value, Input):
-          if yielded_value.is_available():
-            inputs1[-1].set_result(yielded_value.get())
-            assert inputs1[-1].is_available()
-            inputs1.pop()
-          else:
-            waits.append([SetResultHelper(inputs1[-1], yielded_value)])
-            break  # APPEND_BREAK.
-        else:
-          inputs1[-1].set_result(yielded_value)
+        # !! do we always have .node_iterator property and .set_result(...) method.
+        wait_inputs = inputs1[-1].node_iterator.next()
+        if wait_inputs is None:
           assert inputs1[-1].is_available()
           inputs1.pop()
+        elif wait_inputs:
+          waits.append(list(wait_inputs))  # !! Remove availables first.
+          break  # APPEND_BREAK.
       if inputs1:  # Continue from APPEND_BREAK.
         continue
       waits.pop()
@@ -356,8 +343,9 @@ if __name__ == '__main__':
   assert rgv[0].get() == (19, 31)
   assert rgv[1] is b
 
-  #!! assert 0, run_graph(next_fib.node(20, 30)[1])
-  #!! assert 0, next_fib.node(20, 30)[1].run()
+  assert run_graph(next_fib.node(20, 30)[1])[0].get() == 50
+  assert next_fib.node(20, 30)[1].run() == 50
+  assert next_fib.node(20, 30).run() == (30, 50)
   
   _, c = next_fib.node(a, b)
   area_ab = area.node(a, b)
