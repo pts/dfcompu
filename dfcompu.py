@@ -10,8 +10,7 @@
 # TODO(pts): Produce individual results incrementally?
 # TODO(pts): Document mutability.
 # TODO(pts): Add multithreaded (thread pool, thread-safe) run_graph.
-# TODO(pts): Add graph context.
-# TODO(pts): Add execution context.
+# TODO(pts): Add graph context. (We already have exection context.)
 # TODO(pts): Add printing the graph and peeking.
 # TODO(pts): How to delete values early during graph execution?
 # TODO(pts): Get rid of memory leaks and weak references.
@@ -598,8 +597,8 @@ if __name__ == '__main__':
 
   assert xkeys.node(None).run(context={'Jan': 0, 'Feb': 1}) == ['Feb', 'Jan']
   assert cmul.node(5, ContextInput('x')).run(context={'x': 8}) == 40
-  assert cmul.node(5, None).run(context={'b': 8}) == 40 
+  assert cmul.node(5, None).run(context={'b': 8}) == 40
   # It's OK to omit the _trailing_ context args.
-  assert cmul.node(5).run(context={'b': 8}) == 40 
+  assert cmul.node(5).run(context={'b': 8}) == 40
 
   print 'All OK.'
