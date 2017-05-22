@@ -126,7 +126,11 @@ class Recipe(object):
     return args
 
 
-class NodeSubresultInput(Input):
+class NodeBase(Input):
+  __slots__ = ()
+
+
+class NodeSubresultInput(NodeBase):
   __slots__ = ('node', 'i')
   def __init__(self, node, i):
     self.node = node
@@ -146,7 +150,7 @@ class NodeSubresultInput(Input):
     return self.node.node_iterator
 
 
-class Node(Input):
+class Node(NodeBase):
   __slots__ = ('result', 'has_result', 'recipe', 'inputs', 'node_iterator')
 
   def __init__(self, recipe, inputs):
@@ -210,7 +214,6 @@ class Node(Input):
         self.set_result(value.get())
       else:
         self.set_result(value)
-    yield None
 
   def __len__(self):
     return len(self.recipe.result_names)
@@ -239,26 +242,39 @@ def run_graph(inputs):
     if not isinstance(input, Input):
       raise TypeError(input)
     if not input.is_available():
+      # This subclass is needed by run_graph because it uses the
+      # .node_iterator property.
+      if not isinstance(input, NodeBase):
+      #if not getattr(input, 'node_iterator', None):
+        raise TypeError('Node class expected, got: %r' % type(input))
       unavailable_inputs.append(input)
+      
   if unavailable_inputs:
     waits = [unavailable_inputs]
     while waits:
       inputs1 = waits[-1]
-      # !! All elements of inputs1 must be Node or NodeSubresultInput.
-      #    Only these classes have the .node_iterator propery.
       while inputs1:
         if inputs1[-1].is_available():
           inputs1.pop()
           break
-        # TODO(pts): Nicer catch of StopIteration.
-        # !! do we always have .node_iterator property and .set_result(...) method.
-        wait_inputs = inputs1[-1].node_iterator.next()
-        if wait_inputs is None:
+        for wait_inputs in inputs1[-1].node_iterator:
+          if wait_inputs:
+            wait_inputs = [wait_input for wait_input in wait_inputs if
+                           not wait_input.is_available()]
+            if wait_inputs:
+              for wait_input in wait_inputs:
+                if not isinstance(wait_input, NodeBase):
+                  raise TypeError('Node class expected, got: %r' %
+                                  type(wait_input))
+              del wait_input  # Save memory.
+              waits.append(wait_inputs)
+              break  # APPEND_BREAK.
+        else:
+          wait_inputs = None
           assert inputs1[-1].is_available()
           inputs1.pop()
-        elif wait_inputs:
-          waits.append(list(wait_inputs))  # !! Remove availables first.
-          break  # APPEND_BREAK.
+        if wait_inputs:
+          break  # Break one more for APPEND_BREAK.
       if inputs1:  # Continue from APPEND_BREAK.
         continue
       waits.pop()
