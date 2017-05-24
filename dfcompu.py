@@ -14,6 +14,7 @@
 # nodes in the same time, they will run until they have to wait or they are
 # done, but their results won't be used.
 #
+# TODO(pts): Add start_time, end_time. Also log final exception.
 # TODO(pts): Add force_name to Recipe and Node for presistence.
 # TODO(pts): Add scheduling based on async I/O, sleep and external waiting.
 # TODO(pts): Exception handling, error propagation.
@@ -266,19 +267,23 @@ class Node(NodeBase):
 
     def wrap_node_iterator(weak_node, generator, inputs):
       iterator = generator(*inputs)  # This is delayed until the first call.
-      del generator, inputs  # Save memory.  !!
+      del generator, inputs  # Save memory.
+      result_ary = []
       for value in iterator:
-        if weak_node().result_ary:
+        if result_ary:
           raise RuntimeError('Multiple values yielded by recipe iterator.')
         if isinstance(value, Wait):
           yield value.inputs
         elif isinstance(value, Input):
           yield value.wait().inputs
-          weak_node().set_result(value.get())
+          result_ary.append(value.get())
         else:
-          weak_node().set_result(value)
-      if not weak_node().result_ary:
+          result_ary.append(value)
+      del iterator  # Save memory. Probably not needed.
+      if not result_ary:
         raise RuntimeError('No values yielded by recipe iterator.')
+      # Set the result only this late, after we've got rid of the iterator.
+      weak_node().set_result(result_ary.pop())
 
     self.result_ary = []
     self.recipe = recipe
@@ -293,7 +298,7 @@ class Node(NodeBase):
     return (
         'Node(recipe=%r, result_ary=%r, '
         'inputs=#%d, results=#%d)' %
-        (self.recipe, self.result_ary, len(self.inputs),
+        (self.recipe, self.result_ary, len(self.inputs or ()),
          len(self.recipe.result_names)))
 
   def run(self, **kwargs):
@@ -436,6 +441,11 @@ def _get_unavailable_input_nodes(inputs):
         raise TypeError('Node class expected, got: %r' %
                         type(input))
   return inputs
+
+
+def _clear_node_inputs(nodes):
+  for node in nodes:
+    node.inputs = None
 
 
 def simple_runner(pending_inputs):
@@ -639,12 +649,19 @@ def run_graph(inputs, context=None, runner=None):
       #if not getattr(input, 'node_iterator', None):
         raise TypeError('Node class expected, got: %r' % type(input))
       pending_inputs.append(input)
+  del input  # Save memory.
 
   nodes = _find_all_nodes(pending_inputs)
   _rename_nodes(nodes)
   print 'All nodes: %r' % [node.name for node in nodes]
   _fix_context_inputs(nodes)
   _add_context_to_node_inputs(nodes, context)
+  # This is needed for test_early_delete to succeed. Without this the Node
+  # objects have access to their dependent (input) node objects via
+  # node.inputs, and all node objects have node.result_ary, keeping a reference
+  # to old, temporary results.
+  _clear_node_inputs(nodes)
+  node = None  # Save memory.
   del nodes  # Save memory.
 
   # The runner may modify the pending_inputs list in place.
@@ -737,6 +754,65 @@ def bad_luck():
   raise ValueError('Bad luck.')
 
 
+def test_early_delete():
+  """Test that intermediate values are deleted early in graph execution.
+
+  This test is exepected fail in Jython, PyPi and all Python implementations
+  without reference counting. Probably only CPython has reference counting.
+  """
+
+  class LoggingNumber(object):
+    """A number which logs __init__ and __del__ calls."""
+    __slots__ = ('nvalue', 'log_list')
+    def __init__(self, nvalue, log_list):
+      log_list.append(nvalue)
+      self.nvalue = nvalue
+      self.log_list = log_list
+    def __del__(self):
+      self.log_list.append(-self.nvalue)
+    def __add__(self, nvalue):
+      return type(self)(self.nvalue + nvalue, self.log_list)
+    def __radd__(self, nvalue):
+      return type(self)(nvalue + self.nvalue, self.log_list)
+
+  @recipe
+  def add(a, b):
+    return a + b
+
+  def build_add_graph(ln, count):
+    """Create a graph, which adds 1 count times to ln."""
+    for _ in xrange(count):
+      ln = add.node(ln, 1)
+    return ln
+
+  def test_with_runner(runner=None):
+    import gc
+    old_gc = gc.isenabled()
+    try:
+      gc.disable()
+      base, count = 1, 100
+      log_list = []
+      result_node = build_add_graph(LoggingNumber(base, log_list), count)
+      assert result_node.run(runner=runner).nvalue == base + count
+      expected_log_list = [base]
+      for i in xrange(base, base + count):
+        expected_log_list.append(i + 1)
+        # It's important that __del__ on the previous temporary value is called
+        # (hence the negative -i value here) right after the current value is
+        # created.
+        expected_log_list.append(-i)
+      assert expected_log_list == log_list, (expected_log_list, log_list)
+    finally:
+      if old_gc:
+        gc.enable()
+      else:
+        gc.disable()
+
+  test_with_runner()
+  test_with_runner(runner=thread_pool_runner(1))
+  test_with_runner(runner=thread_pool_runner(3))
+
+
 def build_acr_graph():
   a = 5
   b = ConstantInput(7)
@@ -809,6 +885,8 @@ def test_main():
     assert 0, area.node(bl, bl).run(runner=thread_pool_runner(3))
   except ValueError, e:
     assert str(e) == 'Bad luck.'
+
+  test_early_delete()
 
   print 'All OK.'
 
