@@ -569,8 +569,8 @@ def thread_pool_runner(pool_size):
           # No need to print this, simple_runner doesn't print it either.
           #if item[1] is not None:
           #  sys.stderr.write('Exception in node: %s\n' % item[1].name)
-          e = item[2]
-          raise e[0], e[1], e[2]
+          exc_info = item[2]
+          raise exc_info[0], exc_info[1], exc_info[2]
         elif item[0] == 'wait':
           node, blockers = item[1], item[2]
           assert node in nonblocked_nodes
