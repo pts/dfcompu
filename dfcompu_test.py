@@ -4,7 +4,7 @@
 import unittest
 
 from dfcompu import recipe, ConstantInput, run_graph, thread_pool_runner
-from dfcompu import InputSequence, ContextInput
+from dfcompu import InputSequence, ContextInput, ExceptionResult
 
 
 @recipe
@@ -141,26 +141,27 @@ class DfcompuTest(unittest.TestCase):
     a = 5
     b = ConstantInput(7)
     _, c = next_fib.node(a, b)
+    _, d = next_fib.node(b, c)
     area_ab = area.node(a, b)
     circumference_ab = circumference.node(a, b)
-    return cond.node(c, area_ab, circumference_ab)
+    return cond.node(d, area_ab, circumference_ab)
 
   def test_misc(self):
-    print area
-    print area(5, 6)
+    #print area
+    assert area(5, 6) == 30
     #  Simple call without a graph, for unit tests.
     assert area(ConstantInput(5), 6) == 30
     assert cond(0, 7, 8) == 8
     assert or_all(False, (), [], 33, 0, 44, 0.0) == 33
 
-    a = 5  # !! Reuse implicit ConstantInput objects within the graph?
+    a = 5  # TODO(pts): Reuse implicit ConstantInput objects within the graph?
     b = ConstantInput(7)
     abn = (a, b)
     abn = next_fib.node(*abn)
     abn = next_fib.node(*abn)
     abn = next_fib.node(*abn)
     rgv = run_graph((abn, b))
-    print rgv
+    #print rgv
     assert len(rgv) == 2
     assert rgv[0].get() == (19, 31)
     assert rgv[1] is b
@@ -173,6 +174,26 @@ class DfcompuTest(unittest.TestCase):
     run_graph((acr,))
     assert acr.is_available()
     assert acr.get() == 35
+
+    acr = self.build_acr_graph()
+    debug_nodes = []
+    fake_time_ary = [100]
+    def fake_get_time():
+      fake_time_ary[0] += 10
+      return fake_time_ary[0]
+    run_graph((acr,), debug_nodes=debug_nodes, get_time_func=fake_get_time)
+    assert acr.is_available()
+    assert acr.get() == 35
+    node_names = [node.name for node in debug_nodes]
+    # Node names are in BFS (depth) order, not simple_runner execution order
+    # (which if DFS order).
+    assert node_names == [
+        'cond', 'next_fib#1', 'area', 'circumference', 'next_fib#2']
+    # `circumference' is not called at all, it's on the wrong branch of `cond'.
+    assert [(node.name, node.start_time, node.end_time)
+            for node in debug_nodes] == [
+        ('cond', 110, 180), ('next_fib#1', 120, 150), ('area', 160, 170),
+        ('circumference', None, None), ('next_fib#2', 130, 140)]
 
     acr = self.build_acr_graph()
     run_graph((acr,), runner=thread_pool_runner(1))
@@ -208,6 +229,20 @@ class DfcompuTest(unittest.TestCase):
       assert 0, area.node(bl, bl).run(runner=thread_pool_runner(3))
     except ValueError, e:
       assert str(e) == 'Bad luck.'
+
+    debug_nodes = []
+    fake_time_ary[0] = 100
+    try:
+      bl = bad_luck.node()
+      assert 0, area.node(bl, bl).run(
+          get_time_func=fake_get_time, debug_nodes=debug_nodes,
+          runner=thread_pool_runner(3))
+    except ValueError, e:
+      assert str(e) == 'Bad luck.'
+    assert [(node.name, node.start_time, node.end_time, node.result_ary)
+            for node in debug_nodes] == [
+        ('area', 110, None, []),
+        ('bad_luck', 120, 130, [ExceptionResult(ValueError('Bad luck.',))])]
 
 
 if __name__ == '__main__':

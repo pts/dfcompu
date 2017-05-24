@@ -14,7 +14,6 @@
 # nodes in the same time, they will run until they have to wait or they are
 # done, but their results won't be used.
 #
-# TODO(pts): Add start_time, end_time. Also log final exception.
 # TODO(pts): Add force_name to Recipe and Node for presistence.
 # TODO(pts): Add scheduling based on async I/O, sleep and external waiting.
 # TODO(pts): Exception handling, error propagation.
@@ -31,6 +30,8 @@
 #
 
 import collections
+import sys
+import time
 import weakref
 
 def is_generator_function(object):  # From inspect.isgeneratorfunction.
@@ -251,9 +252,23 @@ class NodeSubresultInput(NodeBase):
         self.node.name, self.node.recipe.result_names[self.i])
 
 
+class ExceptionResult(object):
+  """Holds an exception object, to be used in node results."""
+  __slots__ = ('exc',)
+  def __init__(self, exc):
+    self.exc = exc
+  def __repr__(self):
+    return 'ExceptionResult(%r)' % (self.exc,)
+  def __eq__(self, other):
+    return (isinstance(other, ExceptionResult) and
+            type(self.exc) == type(other.exc) and
+            self.exc.args == other.exc.args)
+
+
 class Node(NodeBase):
   __slots__ = ('result_ary', 'recipe', 'inputs', 'node_iterator',
-               'name', '__weakref__')
+               'name', 'start_time', 'end_time', 'get_time_func',
+               '__weakref__')
 
   def __init__(self, recipe, inputs):
     if not isinstance(recipe, Recipe):
@@ -269,16 +284,28 @@ class Node(NodeBase):
       iterator = generator(*inputs)  # This is delayed until the first call.
       del generator, inputs  # Save memory.
       result_ary = []
-      for value in iterator:
-        if result_ary:
-          raise RuntimeError('Multiple values yielded by recipe iterator.')
-        if isinstance(value, Wait):
-          yield value.inputs
-        elif isinstance(value, Input):
-          yield value.wait().inputs
-          result_ary.append(value.get())
-        else:
-          result_ary.append(value)
+      weak_node().start_time = weak_node().get_time_func()
+      is_exc = True
+      try:
+        for value in iterator:
+          is_exc = False
+          if result_ary:
+            raise RuntimeError('Multiple values yielded by recipe iterator.')
+          if isinstance(value, Wait):
+            yield value.inputs
+          elif isinstance(value, Input):
+            yield value.wait().inputs
+            result_ary.append(value.get())
+          else:
+            result_ary.append(value)
+          is_exc = True
+      except:
+        exc_info = sys.exc_info()
+        if is_exc:
+          del iterator  # Save memory.
+          # TODO(pts): Save the traceback (exc_info[1])?
+          weak_node().set_result(ExceptionResult(exc_info[1]))
+        raise exc_info[0], exc_info[1], exc_info[2]
       del iterator  # Save memory. Probably not needed.
       if not result_ary:
         raise RuntimeError('No values yielded by recipe iterator.')
@@ -288,8 +315,10 @@ class Node(NodeBase):
     self.result_ary = []
     self.recipe = recipe
     # list instead of tuple so _fix_context_inputs can change it in place.
-    self.inputs = list(inputs)  # TODO(pts): Does this cause memory leaks?
+    self.inputs = list(inputs)
     self.name = self.recipe.generator.func_name
+    self.start_time = self.end_time = None
+    self.get_time_func = time.time
     self.node_iterator = wrap_node_iterator(
         weakref.ref(self), self.recipe.generator, self.inputs)
 
@@ -333,8 +362,9 @@ class Node(NodeBase):
     # Setting the result has to be atomic, in case multiple threads are
     # calling .is_available().
     result_ary.append(result)
-    if len(result_ary) > 1:
+    if len(result_ary) > 1:  # Shouldn't happen.
       raise RuntimeError('Concurrent set_result call.')
+    self.end_time = self.get_time_func()
     self.node_iterator = None
 
   def __len__(self):
@@ -350,6 +380,7 @@ class Node(NodeBase):
 
 
 def _find_all_nodes(inputs):
+  """Returns nodes in BFS (depth) order except for InputSequence."""
   cache = set()
   todo = []
   for input3 in inputs:
@@ -468,7 +499,6 @@ def simple_runner(pending_inputs):
 
 def _run_worker_thread(runnable_queue, report_queue, abort_ary):
   """Takes work from runnable_queue, does work, reports to report_queue."""
-  import sys
   try:
     while 1:
       input = None
@@ -504,7 +534,6 @@ def thread_pool_runner(pool_size):
     raise ValueError('Expected positive thread pool size, got: %d' % pool_size)
 
   def thread_pool_runner_run(pending_inputs):
-    import sys
     import thread
     import Queue
 
@@ -539,7 +568,6 @@ def thread_pool_runner(pool_size):
           active_worker_thread_count -= 1
           # No need to print this, simple_runner doesn't print it either.
           #if item[1] is not None:
-          #  import sys
           #  sys.stderr.write('Exception in node: %s\n' % item[1].name)
           e = item[2]
           raise e[0], e[1], e[2]
@@ -620,11 +648,20 @@ def thread_pool_runner(pool_size):
   return thread_pool_runner_run
 
 
-def run_graph(inputs, context=None, runner=None):
+def run_graph(inputs, context=None, runner=None, debug_nodes=None,
+              get_time_func=None):
   """Makes sure all inputs are available.
 
   run_graph is idempotent, it doesn't rerun already computed nodes.
 
+  Args:
+    inputs: An Input object or an iterable of Input objects.
+    context: The context dict to be used or None (for {}).
+    runner: The recipe runner function to be used or None (for simple_runner).
+    debug_nodes: The list to append all non-available nodes to, or None to
+      disable debug mode.
+    get_time_func: The funtrion returning the current time as a float or int or
+      long, or None for time.time.
   Returns:
     inputs converted to tuple, all available.
   """
@@ -638,6 +675,13 @@ def run_graph(inputs, context=None, runner=None):
     inputs = (inputs,)
   else:
     inputs = tuple(inputs)
+  if not (isinstance(debug_nodes, list) or debug_nodes is None):
+    raise TypeError
+  if get_time_func is None:
+    get_time_func = time.time
+  if not callable(get_time_func):
+    raise TypeError
+
   pending_inputs = []
   for input in inputs:
     if not isinstance(input, Input):
@@ -653,20 +697,24 @@ def run_graph(inputs, context=None, runner=None):
 
   nodes = _find_all_nodes(pending_inputs)
   _rename_nodes(nodes)
-  print 'All nodes: %r' % [node.name for node in nodes]
+  #print 'All nodes: %r' % [node.name for node in nodes]
   _fix_context_inputs(nodes)
   _add_context_to_node_inputs(nodes, context)
-  # This is needed for test_early_delete to succeed. Without this the Node
-  # objects have access to their dependent (input) node objects via
-  # node.inputs, and all node objects have node.result_ary, keeping a reference
-  # to old, temporary results.
-  _clear_node_inputs(nodes)
+  if debug_nodes is None:
+    # This is needed for test_early_delete to succeed. Without this the Node
+    # objects have access to their dependent (input) node objects via
+    # node.inputs, and all node objects have node.result_ary, keeping a
+    # reference to old, temporary results.
+    _clear_node_inputs(nodes)
+  else:
+    debug_nodes.extend(nodes)
+  for node in nodes:
+    node.get_time_func = get_time_func
   node = None  # Save memory.
   del nodes  # Save memory.
 
   # The runner may modify the pending_inputs list in place.
   runner(pending_inputs=pending_inputs)
-
   return inputs
 
 
