@@ -1,6 +1,7 @@
 #! /usr/bin/python
 # by pts@fazekas.hu at Mon May 22 15:33:44 CEST 2017
 
+import sys
 import unittest
 
 from dfcompu import recipe, ConstantInput, run_graph, thread_pool_runner
@@ -86,6 +87,12 @@ class DfcompuTest(unittest.TestCase):
     without reference counting. Probably only CPython has reference counting.
     """
 
+    try:
+      sys.getrefcount(())
+      has_refcount = True
+    except (AttributeError, NotImplementedError):
+      has_refcount = False
+
     class LoggingNumber(object):
       """A number which logs __init__ and __del__ calls."""
       __slots__ = ('nvalue', 'log_list')
@@ -114,7 +121,10 @@ class DfcompuTest(unittest.TestCase):
       import gc
       old_gc = gc.isenabled()
       try:
-        gc.disable()
+        try:
+          gc.disable()
+        except NotImplementedError:  # In Jython.
+          pass
         base, count = 1, 100
         log_list = []
         result_node = build_add_graph(LoggingNumber(base, log_list), count)
@@ -126,12 +136,21 @@ class DfcompuTest(unittest.TestCase):
           # called (hence the negative -i value here) right after the
           # current value is created.
           expected_log_list.append(-i)
-        assert expected_log_list == log_list, (expected_log_list, log_list)
+        assert ([x for x in expected_log_list if x > 0] ==
+                [x for x in log_list if x > 0])
+        if has_refcount:
+          assert expected_log_list == log_list, (
+              expected_log_list, log_list,
+              'Expected to fail in Jython, PyPy all non-reference-counting '
+              'implementations of Python.')
       finally:
         if old_gc:
           gc.enable()
         else:
-          gc.disable()
+          try:
+            gc.disable()
+          except NotImplementedError:  # In Jython.
+            pass
 
     test_with_runner()
     test_with_runner(runner=thread_pool_runner(1))
