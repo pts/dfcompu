@@ -177,7 +177,7 @@ class Recipe(object):
 
   def __call__(self, *args, **kwargs):
     return run_graph(
-        (Node(self, self._prepare_args(*args, **kwargs)),))[0].result
+        (Node(self, self._prepare_args(*args, **kwargs)),))[0].result_ary[0]
 
   def _prepare_args(self, *args, **kwargs):
     arg_names, has_varargs = self.arg_names, self.has_varargs
@@ -251,7 +251,7 @@ class NodeSubresultInput(NodeBase):
 
 
 class Node(NodeBase):
-  __slots__ = ('result', 'has_result', 'recipe', 'inputs', 'node_iterator',
+  __slots__ = ('result_ary', 'recipe', 'inputs', 'node_iterator',
                'name', '__weakref__')
 
   def __init__(self, recipe, inputs):
@@ -268,7 +268,7 @@ class Node(NodeBase):
       iterator = generator(*inputs)  # This is delayed until the first call.
       del generator, inputs  # Save memory.  !!
       for value in iterator:
-        if weak_node().has_result:
+        if weak_node().result_ary:
           raise RuntimeError('Multiple values yielded by recipe iterator.')
         if isinstance(value, Wait):
           yield value.inputs
@@ -277,11 +277,10 @@ class Node(NodeBase):
           weak_node().set_result(value.get())
         else:
           weak_node().set_result(value)
-      if not weak_node().has_result:
+      if not weak_node().result_ary:
         raise RuntimeError('No values yielded by recipe iterator.')
 
-    self.result = None
-    self.has_result = False
+    self.result_ary = []
     self.recipe = recipe
     # list instead of tuple so _fix_context_inputs can change it in place.
     self.inputs = list(inputs)  # TODO(pts): Does this cause memory leaks?
@@ -292,9 +291,9 @@ class Node(NodeBase):
   def __repr__(self):
     # TODO(pts): Display inputs, detect cycles.
     return (
-        'Node(recipe=%r, has_result=%r, result=%r, '
+        'Node(recipe=%r, result_ary=%r, '
         'inputs=#%d, results=#%d)' %
-        (self.recipe, self.has_result, self.result, len(self.inputs),
+        (self.recipe, self.result_ary, len(self.inputs),
          len(self.recipe.result_names)))
 
   def run(self, **kwargs):
@@ -302,21 +301,22 @@ class Node(NodeBase):
     return run_graph((self,), **kwargs)[0].get()
 
   def get(self):
-    if not self.has_result:
+    if not self.result_ary:
       raise RuntimeError('Node result not available yet.')
-    return self.result
+    return self.result_ary[0]
 
   def is_available(self):
-     return self.has_result
+     return bool(self.result_ary)
 
   def wait(self):
-    if self.has_result:
+    if self.result_ary:
       return EMPTY_WAIT
     else:
       return Wait((self,))
 
   def set_result(self, result):
-    if self.has_result:
+    result_ary = self.result_ary
+    if result_ary:
       raise RuntimeError('Setting result multiple times.')
     if self.recipe.result_tuple_type:
       if not isinstance(result, (tuple, list)):
@@ -325,8 +325,11 @@ class Node(NodeBase):
         raise ValueError('Result tuple size mismatch: expected=%d, got=%d' %
                          (len(self.recipe.result_names), len(result)))
       result = self.recipe.result_tuple_type(*result)
-    self.has_result = True
-    self.result = result
+    # Setting the result has to be atomic, in case multiple threads are
+    # calling .is_available().
+    result_ary.append(result)
+    if len(result_ary) > 1:
+      raise RuntimeError('Concurrent set_result call.')
     self.node_iterator = None
 
   def __len__(self):
