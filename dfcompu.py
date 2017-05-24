@@ -3,18 +3,29 @@
 #
 # Compatible with Python 2.4, 2.5, 2.6 and 2.7.
 #
+# doc: For simplicity, graph contexts are not supported, arguments need to
+# be passed around in graph builder functions (e.g. build_acr_graph()).
+#
+# doc: Global caches and graph-specific caches etc. can be passed around either
+# in the context or as ConstantInput values.
+#
+# doc: Exception behavior: The first exception halts execution and gets
+# propagated to the caller of run_graph. If the thread pool is running other
+# nodes in the same time, they will run until they have to wait or they are
+# done, but their results won't be used.
+#
 # TODO(pts): Add force_name to Recipe and Node for presistence.
-# TODO(pts): Rename recipe to recipe retroactively.
-# TODO(pts): Add scheduling based on I/O and external waiting.
+# TODO(pts): Add scheduling based on async I/O, sleep and external waiting.
 # TODO(pts): Exception handling, error propagation.
 # TODO(pts): Produce individual results incrementally?
 # TODO(pts): Document mutability.
-# TODO(pts): Add multithreaded (thread pool, thread-safe) run_graph.
-# TODO(pts): Add graph context. (We already have exection context.)
 # TODO(pts): Add printing the graph and peeking.
 # TODO(pts): How to delete values early during graph execution?
-# TODO(pts): Get rid of memory leaks and weak references.
-# TODO(pts): Support dynamic graph building and cycles that way.
+# TODO(pts): Get rid of memory leaks using weak references. Test when the
+#            garbage collector is disabled.
+# TODO(pts): Support dynamic graph building and cycles that way. This
+#            doesn't play well with thread pools when called from recipe
+#            functions (rather than generators), it blocks a thread.
 # TODO(pts): Ensure that node names are unique.
 #
 
@@ -93,7 +104,7 @@ class ContextInput(Input):
 
 
 def convert_function_to_generator(f, arg_names):
-  def generator(*args):
+  def function_recipe_generator(*args):
     args2 = []
     for i, arg in enumerate(args):
       if i >= len(arg_names) or arg_names[i].endswith('_input'):
@@ -114,8 +125,8 @@ def convert_function_to_generator(f, arg_names):
         args2.append(arg.get())
     del args  # Save memory.
     yield f(*args2)
-  generator.func_name = f.func_name
-  return generator
+  function_recipe_generator.func_name = f.func_name
+  return function_recipe_generator
 
 
 class Recipe(object):
@@ -331,6 +342,7 @@ class Node(NodeBase):
 
 
 def _find_all_nodes(inputs):
+  cache = set()
   todo = []
   for input3 in inputs:
     if (isinstance(input3, ConstantInput) and
@@ -338,28 +350,26 @@ def _find_all_nodes(inputs):
       todo.extend(input2 for input2 in input3.value.items
                   if isinstance(input2, Input) and
                   not input2.is_available() and
-                  id(input2) not in cache)
+                  input2 not in cache)
     else:
       todo.append(input3)
   result = []
-  cache = set()
   for input in todo:
     if not input.is_available() and isinstance(input, NodeBase):
       if isinstance(input, NodeSubresultInput):
         input = input.node
-      input_id = id(input)
-      if input_id not in cache:
-        cache.add(input_id)
+      if input not in cache:
+        cache.add(input)
         result.append(input)
         todo.extend(input2 for input2 in input.inputs
-                    if not input2.is_available() and id(input2) not in cache)
+                    if not input2.is_available() and input2 not in cache)
         for input3 in input.inputs:
           if (isinstance(input3, ConstantInput) and
               isinstance(input3.value, InputSequence)):
             todo.extend(input2 for input2 in input3.value.items
                         if isinstance(input2, Input) and
                         not input2.is_available() and
-                        id(input2) not in cache)
+                        input2 not in cache)
   return result
 
 
@@ -415,7 +425,189 @@ def _add_context_to_node_inputs(nodes, context):
           input2.set_context(context)
 
 
-def run_graph(inputs, context=None):
+def _get_unavailable_input_nodes(inputs):
+  if inputs:
+    inputs = [input for input in inputs if not input.is_available()]
+    for input in inputs:
+      if not isinstance(input, NodeBase):
+        raise TypeError('Node class expected, got: %r' %
+                        type(input))
+  return inputs
+
+
+def simple_runner(pending_inputs):
+  """Runs nodes in the current thread, one at a time."""
+  while pending_inputs:
+    input = pending_inputs[-1]
+    if input.is_available():
+      pending_inputs.pop()
+      continue
+    for wait_inputs in input.node_iterator:
+      wait_inputs = _get_unavailable_input_nodes(wait_inputs)
+      if wait_inputs:
+        pending_inputs.extend(wait_inputs)
+        del wait_inputs  # Save memory.
+        break  # APPEND_BREAK.
+    else:
+      assert input.is_available()
+      pending_inputs.pop()
+
+
+def _run_worker_thread(runnable_queue, report_queue, abort_ary):
+  """Takes work from runnable_queue, does work, reports to report_queue."""
+  import sys
+  try:
+    while 1:
+      input = None
+      if abort_ary:
+        break
+      input = runnable_queue.get()
+      if input is None:  # Indication that the worker thread can stop.
+        break
+      assert not input.is_available()
+      for wait_inputs in input.node_iterator:
+        wait_inputs = _get_unavailable_input_nodes(wait_inputs)
+        if wait_inputs:
+          report_queue.put(('wait', input, wait_inputs))
+          del wait_inputs  # Save memory.
+          break
+      else:  # Node done.
+        report_queue.put(('done', input))
+  except:
+    exc_info = sys.exc_info()  # (exc_type, exc_value, exc_traceback).
+    # input can be None.
+    report_queue.put(('exc', input, exc_info))
+    # Don't continue doing more work. The first exception should stop the
+    # graph run.
+    return
+  report_queue.put(('exit',))
+
+
+def thread_pool_runner(pool_size):
+  """Runs nodes in a thread pool, possibly many at a time."""
+  if not isinstance(pool_size, int):
+    raise TypeError
+  if pool_size < 1:
+    raise ValueError('Expected positive thread pool size, got: %d' % pool_size)
+
+  def thread_pool_runner_run(pending_inputs):
+    import sys
+    import thread
+    import Queue
+
+    # Maps nodes to list of nodes they are blocked on.
+    # TODO(pts): Use faster value types than lists.
+    blocked_nodes = {}
+    # Maps nodes to list of nodes they are blocking.
+    # TODO(pts): Use faster value types than lists.
+    blockings = {}
+    # Contains nodes which are either runnable or being run by a worker thread.
+    nonblocked_nodes = set(pending_inputs)
+
+    abort_ary = []  # Workers threads ignore the queue if this is not empty.
+    runnable_queue = Queue.Queue()
+    report_queue = Queue.Queue()
+    active_worker_thread_count = pool_size
+    for _ in xrange(pool_size):
+      thread.start_new_thread(
+          _run_worker_thread, (runnable_queue, report_queue, abort_ary))
+
+    for node in pending_inputs:
+      runnable_queue.put(node)
+    del node, pending_inputs  # Save memory.
+
+    try:
+      while nonblocked_nodes:
+        assert active_worker_thread_count
+        # !! Allow Ctrl-<C> to abort, doesn't work on Queue.Queue.get(),
+        # Also below. Solution: run .get() in another, non-main thread.
+        item = report_queue.get()
+        if item[0] == 'exc':
+          active_worker_thread_count -= 1
+          # No need to print this, simple_runner doesn't print it either.
+          #if item[1] is not None:
+          #  import sys
+          #  sys.stderr.write('Exception in node: %s\n' % item[1].name)
+          e = item[2]
+          raise e[0], e[1], e[2]
+        elif item[0] == 'wait':
+          node, blockers = item[1], item[2]
+          assert node in nonblocked_nodes
+          assert node not in blocked_nodes
+          assert not node.is_available()
+          nonblocked_nodes.remove(node)
+          blocked_nodes[node] = blockers = list(blockers)
+          for blocker_node in blockers:
+            # _get_unavailable_input_nodes() ensures this.
+            assert not blocker_node.is_available()
+            if blocker_node in blockings:
+              assert node not in blockings[blocker_node]  # Slow.
+              blockings[blocker_node].append(node)
+            else:
+              blockings[blocker_node] = [node]
+            # Can we have `blocker_node in blocked_nodes' here?
+            #   Yes. Let's suppose b needs c; c needs d; e needs c;
+            #   we need b and e; b executes first; b starts waiting for c; c
+            #   executes; c starts waiting dor d; e executes; e starts waiting
+            #   for c now. Now c is blocker_node, and c is blocked.
+            # Can we have `blocker_node in nonblocked_nodes' here?
+            #   Yes. Let's suppose b needs c; e needs c; we need b and e;
+            #   b executes first; b starts waiting for c; c executes slowly;
+            #   in another thread e executes; e starts waiting for c now.
+            #   Now c is blocker_node and c is still executing, thus it's in
+            #   nonblocked_nodes.
+            if (blocker_node not in blocked_nodes and
+                blocker_node not in nonblocked_nodes):
+              nonblocked_nodes.add(blocker_node)
+              runnable_queue.put(blocker_node)
+          del node, blocker_node, blockers  # Save memory.
+        elif item[0] == 'done':
+          node = item[1]
+          assert node in nonblocked_nodes
+          assert node not in blocked_nodes
+          assert node.is_available()
+          nonblocked_nodes.remove(node)
+          blocking = blockings.pop(node, None)
+          if blocking:
+            for blocked_node in blocking:
+              assert blocked_node in blocked_nodes
+              blockers = blocked_nodes[blocked_node]
+              blockers.remove(node)
+              if not blockers:
+                del blocked_nodes[blocked_node]
+                assert blocked_node not in nonblocked_nodes
+                #assert blocked_node in blocked_nodes  # Just deleted.
+                assert not blocked_node.is_available()
+                nonblocked_nodes.add(blocked_node)
+                runnable_queue.put(blocked_node)
+            blocked_node = None  # Save memory.
+          del node, blocking  # Save memory.
+        elif item[0] == 'exit':
+          assert 0, 'Unexpected early exit of worker thread.'
+          active_worker_thread_count -= 1
+        else:
+          assert 0, 'Unknown report type: %r' % (item[0],)
+        del item  # Save memory.
+    finally:
+      abort_ary.append(1)  # This signals busy worker threads.
+      for _ in xrange(pool_size):
+        # This signals worker threads waiting for more work.
+        runnable_queue.put(None)
+      while active_worker_thread_count > 0:
+        item = report_queue.get()
+        if item[0] in ('exc', 'exit'):
+          active_worker_thread_count -= 1
+      # Unfortunately Python doesn't let us wait for the thread exit. But it
+      # will happen very soon, because _run_worker_thread returns shortly after
+      # sending an 'exc' or an 'exit'.
+
+    if blocked_nodes or blockings:
+      raise RuntimeError('Unexpectedly blocked nodes in the end.')
+
+  return thread_pool_runner_run
+
+
+def run_graph(inputs, context=None, runner=None):
   """Makes sure all inputs are available.
 
   run_graph is idempotent, it doesn't rerun already computed nodes.
@@ -425,6 +617,8 @@ def run_graph(inputs, context=None):
   """
   if context is None:
     context = {}
+  if runner is None:
+    runner = simple_runner
   elif not isinstance(context, dict):
     raise TypeError('context must be a dict.')
   if isinstance(inputs, Input):
@@ -450,28 +644,8 @@ def run_graph(inputs, context=None):
   _add_context_to_node_inputs(nodes, context)
   del nodes  # Save memory.
 
-  # Run nodes whose result is necessary.
-  while pending_inputs:
-    input = pending_inputs[-1]
-    if input.is_available():
-      pending_inputs.pop()
-      break
-    for wait_inputs in input.node_iterator:
-      if wait_inputs:
-        wait_inputs = [wait_input for wait_input in wait_inputs if
-                       not wait_input.is_available()]
-        if wait_inputs:
-          for wait_input in wait_inputs:
-            if not isinstance(wait_input, NodeBase):
-              raise TypeError('Node class expected, got: %r' %
-                              type(wait_input))
-          del wait_input  # Save memory.
-          pending_inputs.extend(wait_inputs)
-          del wait_inputs  # Save memory.
-          break  # APPEND_BREAK.
-    else:
-      assert input.is_available()
-      pending_inputs.pop()
+  # The runner may modify the pending_inputs list in place.
+  runner(pending_inputs=pending_inputs)
 
   return inputs
 
@@ -555,7 +729,21 @@ def xkeys(context):
   return sorted(context)
 
 
-if __name__ == '__main__':
+@recipe
+def bad_luck():
+  raise ValueError('Bad luck.')
+
+
+def build_acr_graph():
+  a = 5
+  b = ConstantInput(7)
+  _, c = next_fib.node(a, b)
+  area_ab = area.node(a, b)
+  circumference_ab = circumference.node(a, b)
+  return cond.node(c, area_ab, circumference_ab)
+
+
+def test_main():
   print area
   print area(5, 6)
   #  Simple call without a graph, for unit tests.
@@ -563,7 +751,7 @@ if __name__ == '__main__':
   assert cond(0, 7, 8) == 8
   assert or_all(False, (), [], 33, 0, 44, 0.0) == 33
 
-  a = 5  # !! Reuse ConstantInput objects within the graph?
+  a = 5  # !! Reuse implicit ConstantInput objects within the graph?
   b = ConstantInput(7)
   abn = (a, b)
   abn = next_fib.node(*abn)
@@ -579,12 +767,18 @@ if __name__ == '__main__':
   assert next_fib.node(20, 30)[1].run() == 50
   assert next_fib.node(20, 30).run() == (30, 50)
 
-  _, c = next_fib.node(a, b)
-  area_ab = area.node(a, b)
-  circumference_ab = circumference.node(a, b)
-  acr = cond.node(c, area_ab, circumference_ab)
-
+  acr = build_acr_graph()
   run_graph((acr,))
+  assert acr.is_available()
+  assert acr.get() == 35
+
+  acr = build_acr_graph()
+  run_graph((acr,), runner=thread_pool_runner(1))
+  assert acr.is_available()
+  assert acr.get() == 35
+
+  acr = build_acr_graph()
+  run_graph((acr,), runner=thread_pool_runner(3))
   assert acr.is_available()
   assert acr.get() == 35
 
@@ -601,4 +795,20 @@ if __name__ == '__main__':
   # It's OK to omit the _trailing_ context args.
   assert cmul.node(5).run(context={'b': 8}) == 40
 
+  try:
+    bl = bad_luck.node()
+    assert 0, area(bl, bl)
+  except ValueError, e:
+    assert str(e) == 'Bad luck.'
+
+  try:
+    bl = bad_luck.node()
+    assert 0, area.node(bl, bl).run(runner=thread_pool_runner(3))
+  except ValueError, e:
+    assert str(e) == 'Bad luck.'
+
   print 'All OK.'
+
+
+if __name__ == '__main__':
+  test_main()
