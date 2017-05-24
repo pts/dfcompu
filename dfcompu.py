@@ -1,32 +1,16 @@
 #! /usr/bin/python
 # by pts@fazekas.hu at Mon May 22 15:33:44 CEST 2017
 #
-# Compatible with Python 2.4, 2.5, 2.6 and 2.7.
-#
-# doc: For simplicity, graph contexts are not supported, arguments need to
-# be passed around in graph builder functions (e.g. build_acr_graph()).
-#
-# doc: Global caches and graph-specific caches etc. can be passed around either
-# in the context or as ConstantInput values.
-#
-# doc: Exception behavior: The first exception halts execution and gets
-# propagated to the caller of run_graph. If the thread pool is running other
-# nodes in the same time, they will run until they have to wait or they are
-# done, but their results won't be used.
+# Directly compatible with Python 2.4, 2.5, 2.6 and 2.7.
 #
 # TODO(pts): Add force_name to Recipe and Node for presistence.
+# TODO(pts): Ensure that node names are unique.
 # TODO(pts): Add scheduling based on async I/O, sleep and external waiting.
-# TODO(pts): Exception handling, error propagation.
 # TODO(pts): Produce individual results incrementally?
-# TODO(pts): Document mutability.
 # TODO(pts): Add printing the graph and peeking.
-# TODO(pts): How to delete values early during graph execution?
-# TODO(pts): Get rid of memory leaks using weak references. Test when the
-#            garbage collector is disabled.
 # TODO(pts): Support dynamic graph building and cycles that way. This
 #            doesn't play well with thread pools when called from recipe
 #            functions (rather than generators), it blocks a thread.
-# TODO(pts): Ensure that node names are unique.
 #
 
 import collections
@@ -138,6 +122,7 @@ class Recipe(object):
   def __init__(self, generator, result=('result',)):
     if not callable(generator) or not getattr(generator, 'func_code', None):
       raise ValueError
+    result = tuple(map(str, result))
     CO_VARARGS = 0x4
     CO_VARKEYWORDS = 0x8
     if generator.func_code.co_argcount < 0:  # Can this happen?
@@ -157,7 +142,7 @@ class Recipe(object):
     if not is_generator_function(generator):
       generator = convert_function_to_generator(generator, arg_names)
     self.generator = generator
-    self.result_names = tuple(map(str, result))
+    self.result_names = result
     if (len(self.result_names) != 1 or
         self.result_names[0] != 'result'):
       if getattr(collections, 'namedtuple', None):
@@ -325,10 +310,10 @@ class Node(NodeBase):
   def __repr__(self):
     # TODO(pts): Display inputs, detect cycles.
     return (
-        'Node(recipe=%r, result_ary=%r, '
+        'Node(recipe=%r, result_ary=%r, start_time=%r, end_time=%r, '
         'inputs=#%d, results=#%d)' %
-        (self.recipe, self.result_ary, len(self.inputs or ()),
-         len(self.recipe.result_names)))
+        (self.recipe, self.result_ary, self.start_time, self.end_time,
+         len(self.inputs or ()), len(self.recipe.result_names)))
 
   def run(self, **kwargs):
     """Convenience method to call run_graph."""
@@ -719,8 +704,30 @@ def run_graph(inputs, context=None, runner=None, debug_nodes=None,
 
 
 def recipe(*args, **kwargs):
-  """Annotation on functions and generators to create Recipe objects."""
-  # !! doc: All *args are of type Input.
+  """Annotation on functions and generators to create Recipe objects.
+
+  The easiest way to apply a @recipe is:
+  
+    @recipe
+    def ...:
+      ...
+
+  The simplest complete example:
+  
+    @recipe
+    def mul(a, b):
+      return a * b
+
+    assert mul(6, 7) == 42
+    assert mul.node(6, 7).run() == 42
+
+  You can also specify keyword arguments, which will be passed to the Recipe
+  constructor:
+
+    @recipe(result=('foo', 'bar'))
+    def ...:
+      ...
+  """
   if kwargs or not args:
     if args:
       raise ValueError

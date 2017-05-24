@@ -1,7 +1,11 @@
 #! /usr/bin/python
 # by pts@fazekas.hu at Wed May 24 18:02:09 CEST 2017
 
-"""Converts the dfcompu source code from Python 2 to Python 3."""
+"""Converts the dfcompu source code from Python 2 to Python 3.
+
+This script works with Python 2.4, 2.5, 2.6, 2.7, 3.4, and possibly other
+Python 3 versions.
+"""
 
 import os
 import os.path
@@ -17,6 +21,7 @@ replacements = (
     (r'except RuntimeError, e', r'except RuntimeError as e'),
     (r'except ValueError, e', r'except ValueError as e'),
     (r'.iteritems()', r'.items()'),
+    # print(...) as to be done manually.
 )
 
 try:
